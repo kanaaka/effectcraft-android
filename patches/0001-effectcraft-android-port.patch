@@ -1,0 +1,158 @@
+diff --git a/crates/text/src/fonts.rs b/crates/text/src/fonts.rs
+index 1df8b33..447ab4a 100644
+--- a/crates/text/src/fonts.rs
++++ b/crates/text/src/fonts.rs
+@@ -89,6 +89,12 @@ impl DirectorySource {
+             if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+                 dirs.push(PathBuf::from(l).join("Microsoft\\Windows\\Fonts"));
+             }
++        } else if cfg!(target_os = "android") {
++            // Android has no Linux font tree: `/usr/share/fonts` and `~/.fonts` do not exist on a
++            // device, so without this the app knows only its bundled families and every document
++            // set in the device's own typeface falls back with no error at all. These are the
++            // platform's own font directories, read without any permission.
++            dirs.extend(["/system/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"].map(PathBuf::from));
+         } else if cfg!(unix) && !cfg!(target_arch = "wasm32") {
+             dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(PathBuf::from));
+             if let Some(h) = &home {
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index be02fef..4aca3aa 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -22,7 +22,14 @@ effectcraft-render = { workspace = true }
+ effectcraft-engine = { workspace = true }
+ effectcraft-gpu = { workspace = true }
+ egui = { workspace = true }
+-eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
++# `accesskit` is declared separately, under `cfg(not(target_os = "android"))`, below: eframe
++# `compile_error!`s when `accesskit` and `android-native-activity` meet (egui's accesskit
++# integration on Android goes through the GameActivity backend, while the Android package
++# targets NativeActivity). Cargo applies features only from the target tables whose cfg
++# matches, so the desktop keeps accesskit and Android never asks for it. Cargo unions features
++# across the whole graph, so this has to be fixed *here*, in the only crate that enables
++# accesskit — the Android shell crate cannot turn it off from outside.
++eframe = { workspace = true, features = ["default_fonts", "wgpu"] }
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+ log = { workspace = true }
+@@ -34,6 +41,12 @@ image = { workspace = true }
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ sys-locale = { workspace = true }
+ 
++# The desktop's accessibility tree (screen readers, VoiceOver/Narrator/UIA). Android's side of
++# it needs the GameActivity backend, which `apps/effectcraft-android` does not use, so the
++# feature is simply absent there — see the comment on the base `eframe` dependency above.
++[target.'cfg(not(target_os = "android"))'.dependencies]
++eframe = { workspace = true, features = ["accesskit"] }
++
+ [dev-dependencies]
+ egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
+ pollster = "0.4"
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index ce0cf69..8df8319 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -335,6 +335,19 @@ pub struct EffectcraftApp {
+     applied_prefs: Option<(u64, Option<bool>)>,
+     /// A previous run that didn't exit cleanly (shown by `Dialog::Recovery`).
+     pub recovery: Option<effectcraft_engine::autosave::Recovery>,
++    /// The user asked to quit and nothing more has to be said: the *host* ends the process.
++    ///
++    /// The desktop shell answers `ViewportCommand::Close` and the event loop returns. A host with
++    /// no window to close watches this instead — on Android an app is closed by finishing its
++    /// activity (Java), and winit's Android backend stubs out the window API a close would go
++    /// through, so `ViewportCommand::Close` ends nothing at all there. The Android shell checks
++    /// this flag in **both** `logic` and `ui`: a menu click sets it during `ui`, and no repaint is
++    /// guaranteed afterwards, so waiting for the next `logic` is how File ▸ Exit ends up doing
++    /// nothing until the user clicks again.
++    pub quit_requested: bool,
++    /// A quit that is waiting for an untitled project's Save As dialog: the file is written
++    /// between frames, so the quit has to wait for that answer (`menus::dialog_answered`).
++    pub(crate) quit_pending: bool,
+     /// Docked groups laid out last frame: (active panel, group rect) — `~` maximizes the one
+     /// under the pointer.
+     pub(crate) dock_rects: Vec<(PanelKind, egui::Rect)>,
+@@ -417,6 +430,8 @@ impl EffectcraftApp {
+             last_reveal: None,
+             applied_prefs: None,
+             recovery: None,
++            quit_requested: false,
++            quit_pending: false,
+             dock_rects: vec![],
+             home_thumbs: Default::default(),
+             home_thumb_saved: None,
+diff --git a/crates/ui-egui/src/menus.rs b/crates/ui-egui/src/menus.rs
+index 3f703e4..8171e56 100644
+--- a/crates/ui-egui/src/menus.rs
++++ b/crates/ui-egui/src/menus.rs
+@@ -847,6 +847,13 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
+             Value::Null
+         }
+         "app.quit" => {
++            // A host with no window to close watches `quit_requested` and ends the process there
++            // (the Android shell); the desktop ignores the flag and gets a real close from the
++            // command below. A *modified* project is never killed here: `unsaved` asks about it
++            // first by cancelling the close, and answering that prompt is what sets the flag.
++            if !app.session.is_dirty() {
++                app.quit_requested = true;
++            }
+             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+             Value::Null
+         }
+@@ -1259,6 +1266,11 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
+         "file.exportLottie" => ("path", Ask::Save("Animation.json")),
+         "file.importLottie" => ("path", Ask::Open(&["json", "lottie"])),
+         "file.importTimeline" => ("path", Ask::Open(&["xml", "fcpxml", "otio", "edl", "aaf", "omf"])),
++        // File ▸ Export ▸ Adobe Premiere Pro Project…: the command needs a `path` and had no
++        // dialog route at all, so the menu item failed with "missing `path`" instead of opening a
++        // dialog. The default is the Final Cut Pro XML Premiere Pro imports, which is also what
++        // `export_timeline` infers from an `.xml` name (Premiere's own `.prproj` is not written).
++        "file.exportTimeline" => ("path", Ask::Save("Timeline.xml")),
+         "render.saveCurrentPreview" => ("path", Ask::Save("Preview.mp4")),
+         "file.runScript" if params.get("name").is_none() => ("path", Ask::Open(&["jsx", "js", "jsonl", "json", "txt"])),
+         "file.installScript" | "file.installScriptUIPanel" => ("path", Ask::Open(&["jsx", "js"])),
+@@ -1344,10 +1356,19 @@ fn picked_value(key: &str, paths: Vec<String>) -> Option<Value> {
+ /// A file dialog shown without blocking ([`crate::Hooks::file_dialog_async`]) answered: run its
+ /// command with the picked path (nothing when it was cancelled).
+ pub(crate) fn dialog_answered(app: &mut EffectcraftApp, answer: crate::DialogAnswer) {
+-    let Some(v) = picked_value(answer.key, answer.paths) else { return };
++    let Some(v) = picked_value(answer.key, answer.paths) else {
++        // Cancelled: a quit that was waiting for this dialog goes with it.
++        app.quit_pending = false;
++        return;
++    };
+     if let Err(e) = run_with_picked(app, &answer.command, answer.key, &answer.params, v) {
+         app.ui.status = e;
+     }
++    // A quit that was waiting for this dialog (an untitled project's Save As, from the
++    // unsaved-changes prompt): the file is written now, so the quit can go ahead.
++    if std::mem::take(&mut app.quit_pending) && !app.session.is_dirty() {
++        app.quit_requested = true;
++    }
+ }
+ 
+ /// Run command `id` with the path picked for it in parameter `key`.
+diff --git a/crates/ui-egui/src/panels/unsaved.rs b/crates/ui-egui/src/panels/unsaved.rs
+index e403a9d..ae0141d 100644
+--- a/crates/ui-egui/src/panels/unsaved.rs
++++ b/crates/ui-egui/src/panels/unsaved.rs
+@@ -143,6 +143,9 @@ fn answer_with(app: &mut EffectcraftApp, ctx: &egui::Context, a: Answer) {
+                 return;
+             }
+             if app.session.is_dirty() {
++                // The save dialog is open: the path is chosen between frames, so remember the
++                // quit and let `menus::dialog_answered` finish it once the file is written.
++                app.quit_pending = id == "app.quit";
+                 return;
+             }
+         }
+@@ -150,6 +153,9 @@ fn answer_with(app: &mut EffectcraftApp, ctx: &egui::Context, a: Answer) {
+     }
+     if id == "app.quit" {
+         app.dialog_state.unsaved.quitting = true;
++        // A host with no window to close (Android) ends the process on this flag; the desktop
++        // gets a real close from the command below.
++        app.quit_requested = true;
+         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+         return;
+     }
